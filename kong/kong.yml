@@ -1,0 +1,137 @@
+# Kong declarative config (DB-less)
+# Goals:
+# - Only forward what each FR requires
+# - Enforce Idempotency-Key on mutating endpoints
+# - Never cache POST
+# - Reasonable safety limits + correlation IDs
+# - Basic key-auth for /ops (FR5)
+
+_format_version: "3.0"
+_transform: true
+
+# ───────────────────────────────────────────────────────────────────────────────
+# GLOBAL PLUGINS (apply to all requests)
+# ───────────────────────────────────────────────────────────────────────────────
+plugins:
+  # Add a correlation ID if client didn't send one; propagate to upstream.
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-Id
+      generator: uuid
+      echo_downstream: true
+
+  # Upper bounds for request size (sane defaults; tweak per needs).
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 2    # MB
+      require_content_length: false
+
+  # Reasonable per-IP rate cap for dev. For multi-node prod, switch policy to "redis".
+  - name: rate-limiting
+    config:
+      minute: 1200                # 1,200 req/min per IP (dev-friendly)
+      policy: local               # prod: "redis"
+      fault_tolerant: true
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SERVICE: payment-service (your API)
+# ───────────────────────────────────────────────────────────────────────────────
+services:
+  - name: payment-service
+    url: http://payment-service:8080
+    retries: 2                    # NFR: quick, bounded retries at gateway
+    connect_timeout: 3000         # ms
+    write_timeout:   5000
+    read_timeout:    5000
+
+    routes:
+      # FR1: Create Payments — require Idempotency-Key; never cached
+      - name: payments-create
+        paths: [ /payments ]
+        methods: [ POST ]
+        strip_path: false
+        # Require the Idempotency-Key header (regex: any non-empty string)
+        headers:
+          Idempotency-Key: [ "~.+" ]
+        plugins:
+          # Explicitly disable any caching on POST (defense in depth)
+          - name: proxy-cache
+            enabled: false
+          # Optionally ensure the header name is normalized/passed through
+          - name: request-transformer
+            config:
+              add:
+                headers:
+                  - "Idempotency-Key:$(http_idempotency_key)"  # no-op if already present
+
+      # FR4: Refunds/Cancellations — same idempotency policy
+      - name: refunds-create
+        paths: [ /refunds ]
+        methods: [ POST ]
+        strip_path: false
+        headers:
+          Idempotency-Key: [ "~.+" ]
+        plugins:
+          - name: proxy-cache
+            enabled: false
+
+      # FR3: Reconciliation reports — cacheable GET with short TTL
+      - name: reconciliations-read
+        paths: [ /reconciliations ]
+        methods: [ GET ]
+        strip_path: false
+        plugins:
+          - name: proxy-cache
+            config:
+              strategy: memory       # dev: in-process cache
+              content_type:          # cache JSON only
+                - "application/json"
+              cache_ttl: 60          # 60s; adjust / or disable if strictly fresh
+              response_code:
+                - 200
+              request_method:
+                - GET
+              vary_headers:          # avoid mixing tenants, etc., if you add these later
+                - "Authorization"
+                - "Accept"
+
+      # FR2: Provider webhooks — protect POST, small body, *no caching*
+      - name: moov-webhooks
+        paths: [ /webhooks/moov ]
+        methods: [ POST ]
+        strip_path: false
+        plugins:
+          - name: proxy-cache
+            enabled: false
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1  # MB (webhooks should be small)
+          # If you want to enforce signature header presence at the edge:
+          # - name: request-validator   # (with a schema) or use 'headers' match like below
+        headers:
+          # Require provider signature header (replace with your actual header)
+          Moov-Signature: [ "~.+" ]
+
+      # FR5: Ops/Diagnostics — require API key (separate consumer)
+      - name: ops-endpoints
+        paths: [ /ops ]
+        methods: [ GET, POST ]
+        strip_path: false
+        plugins:
+          - name: key-auth
+            config:
+              key_names: [ "X-API-Key" ]
+              hide_credentials: true
+          - name: proxy-cache
+            enabled: false
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SECURITY for /ops (FR5): define a consumer + credential (DB-less)
+# NOTE: For dev only. In prod, provision via CI/secret store.
+# ───────────────────────────────────────────────────────────────────────────────
+consumers:
+  - username: ops
+
+keyauth_credentials:
+  - consumer: ops
+    key: ${OPS_API_KEY:-dev-ops-key}
